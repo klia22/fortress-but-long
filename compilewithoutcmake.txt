@@ -1,0 +1,9 @@
+# Compile all .c files into object files
+find . -name "*.c" -exec gcc -c -O3 -DNDEBUG -fwrapv \
+    -I. -Ifeatures -Iloot -Iloot/loot_tables -Iloot/cjson {} \;
+
+# Archive them into a static library
+ar rcs libcubiomes.a *.o
+
+# Clean up object files
+rm -f *.o
