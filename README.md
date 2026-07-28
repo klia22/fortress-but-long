@@ -1,2 +1,5 @@
 # fortress-but-long
-i just had a great idea. now using this as my space to create a 1000+ block long fortress
+
+This is a work in progress...
+
+Made a plan trying to calculate chances and ideal position next...

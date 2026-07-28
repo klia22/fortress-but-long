@@ -1,0 +1,16 @@
+Idea: 2 phase search
+
+Stage 1:
+
+Using java random reversal to find a place where a row of 5 fortresses at ideal positions are found
+
+Stage 2:
+
+Move the structure to different places and find a place where i get lucky and all fortresses connects
+
+Important steps before constructing algorithm:
+
+1: Calculate ideal structure positions
+2: Calculate chance of connecting
+3: Choose appropriate way of reversing java random
+
