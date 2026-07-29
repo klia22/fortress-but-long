@@ -18,8 +18,29 @@ Important steps before constructing algorithm:
 
 
 Ideal structure positions:
-(112, 0)   -> extends to (4, -40) and (220, -40)
-(328, -80) -> extends to (220, -40) and (436, -40)
-(544, 0)   -> extends to (436, -40) and (652, -40)
-(760, -80) -> extends to (652, -40) and (868, -40)
-(976, 0)   -> extends to (868, -40) and (1084, -40)
+Region (0,0)  -> (112,0)
+    Extends to (8,-32) and (216,-32)
+
+Region (0,-1) -> (320,-64)
+    Extends to (216,-32) and (424,-32)
+
+Region (1,0)  -> (528,0)
+    Extends to (424,-32) and (632,-32)
+
+Region (1,-1) -> (736,-64)
+    Extends to (632,-32) and (840,-32)
+
+Region (2,0)  -> (944,0)
+    Extends to (840,-32) and (1048,-32)
+
+
+Convert into LCG outputs:
+Solving for seed.
+salt = 30084232
+xMul = 341873128712
+zMul = 132897987541
+Region: (0,0)   => nextInt(seed + salt)                  -> (7,0) mod 23
+Region: (0,-1)  => nextInt(seed + salt - zMul)           -> (20,22) mod 23
+Region: (1,0)   => nextInt(seed + salt + xMul)           -> (6,0) mod 23
+Region: (1,-1)  => nextInt(seed + salt + xMul - zMul)    -> (19,22) mod 23
+Region: (2,0)   => nextInt(seed + salt + xMul + xMul)    -> (5,0) mod 23
