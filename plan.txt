@@ -14,3 +14,12 @@ Important steps before constructing algorithm:
 2: Calculate chance of connecting
 3: Choose appropriate way of reversing java random
 
+
+
+
+Ideal structure positions:
+(112, 0)   -> extends to (4, -40) and (220, -40)
+(328, -80) -> extends to (220, -40) and (436, -40)
+(544, 0)   -> extends to (436, -40) and (652, -40)
+(760, -80) -> extends to (652, -40) and (868, -40)
+(976, 0)   -> extends to (868, -40) and (1084, -40)
