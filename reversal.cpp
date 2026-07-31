@@ -5,12 +5,16 @@
 #include <atomic>
 #include <chrono>
 #include <iomanip>
+#include <pthread.h>
+#include <csignal>
+#include <unistd.h>
+
+using namespace std;
 
 const uint64_t MULTIPLIER = 0x5DEECE66DULL;
 const uint64_t ADDEND = 0xBULL;
 const uint64_t MASK = (1ULL << 48) - 1;
 const uint64_t INV_MULTIPLIER = 0xDFE05BCB1365ULL;
-
 const uint64_t RANGE = 23; 
 
 struct Constraint {
@@ -28,13 +32,28 @@ struct L0_Data {
     }
 };
 
-std::atomic<bool> seed_found(false);
-std::atomic<uint64_t> progress_counter(0);
+atomic<bool> stop_search(false);
+atomic<uint64_t> global_K0(0);
+atomic<uint64_t> progress_counter(0);
 
-bool verify(uint64_t base, bool use_xor, const std::vector<Constraint>& cons) {
+vector<Constraint> constraints;
+vector<L0_Data> l0_table;
+uint64_t MOD_WINDOW;
+const uint64_t TOTAL_K0 = 93368854; 
+chrono::time_point<chrono::steady_clock> start_time;
+
+vector<uint64_t> found_seeds;
+pthread_mutex_t result_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void handle_sigint(int sig) {
+    stop_search = true;
+}
+
+bool verify(uint64_t base, const vector<Constraint>& cons) {
     for (size_t i = 1; i < cons.size(); i++) { 
         uint64_t state = (base + cons[i].offset) & MASK;
-        if (use_xor) state ^= 0x5DEECE66DULL;
+        state ^= 0x5DEECE66DULL; // Hardcoded XOR application
         
         state = (state * MULTIPLIER + ADDEND) & MASK;
         if ((state >> 17) % RANGE != cons[i].out1) return false;
@@ -46,116 +65,128 @@ bool verify(uint64_t base, bool use_xor, const std::vector<Constraint>& cons) {
     return true;
 }
 
-int main() {
-    // Range-based constraints
-    std::vector<Constraint> constraints = {
-        {30084232LL, 7, 0, 2},
-        {-132867903309LL, 20, 20, 22},
-        {341903212944LL, 6, 0, 2},
-        {209005225403LL, 19, 20, 22},
-        {683776341656LL, 5, 0, 2}
-    };
+void* worker_thread(void* arg) {
+    while (!stop_search) {
+        uint64_t chunk_start = global_K0.fetch_add(4096);
+        if (chunk_start > TOTAL_K0) break;
+        uint64_t chunk_end = min(chunk_start + 4096 - 1, TOTAL_K0);
 
-    uint64_t MOD_WINDOW = RANGE * 131072ULL; 
+        for (uint64_t K0 = chunk_start; K0 <= chunk_end; K0++) {
+            if (stop_search) break;
 
-    std::vector<L0_Data> l0_table(131072);
-    for (uint64_t l0 = 0; l0 < 131072; l0++) {
-        l0_table[l0] = {(l0 * MULTIPLIER) % MOD_WINDOW, l0};
-    }
-    std::sort(l0_table.begin(), l0_table.end());
-
-    std::cout << "Cracking across all CPU cores for Range Bounds..." << std::endl;
-    
-    const uint64_t TOTAL_K0 = 93368854; 
-    auto start_time = std::chrono::steady_clock::now();
-
-    #pragma omp parallel for schedule(dynamic, 4096)
-    for (uint64_t K0 = 0; K0 <= TOTAL_K0; K0++) {
-        if (seed_found.load(std::memory_order_relaxed)) continue;
-        
-        uint64_t current_prog = progress_counter.fetch_add(1, std::memory_order_relaxed);
-        if (current_prog > 0 && current_prog % 10000 == 0) {
-            auto now = std::chrono::steady_clock::now();
-            std::chrono::duration<double> elapsed = now - start_time;
-            double speed = current_prog / elapsed.count();
-            
-            #pragma omp critical
-            {
-                std::cout << "Progress: " << std::fixed << std::setprecision(2) 
-                          << (current_prog * 100.0 / TOTAL_K0) << "% (" 
-                          << current_prog << " / " << TOTAL_K0 << ") "
-                          << "| Speed: " << (speed / 1000000.0) << " M/s\n";
+            uint64_t current_prog = progress_counter.fetch_add(1);
+            if (current_prog > 0 && current_prog % 10000 == 0) {
+                auto now = chrono::steady_clock::now();
+                chrono::duration<double> elapsed = now - start_time;
+                double speed = current_prog / elapsed.count();
+                
+                pthread_mutex_lock(&print_mutex);
+                cout << "Progress: " << fixed << setprecision(2) 
+                     << (current_prog * 100.0 / TOTAL_K0) << "% (" 
+                     << current_prog << " / " << TOTAL_K0 << ") "
+                     << "| Speed: " << (speed / 1000000.0) << " M/s\n";
+                pthread_mutex_unlock(&print_mutex);
             }
-        }
 
-        uint64_t U1 = RANGE * K0 + constraints[0].out1; 
-        uint64_t BaseVal = ((U1 << 17) * MULTIPLIER + ADDEND) & MASK;
+            uint64_t U1 = RANGE * K0 + constraints[0].out1; 
+            uint64_t BaseVal = ((U1 << 17) * MULTIPLIER + ADDEND) & MASK;
 
-        // Iterate over allowed out2 bounds for constraint 0
-        for (int target_out2 = constraints[0].out2_min; target_out2 <= constraints[0].out2_max; target_out2++) {
-            for (uint64_t W = 0; W <= 13; W++) {
-                
-                int64_t target_base = (int64_t)target_out2 * 131072LL;
-                
-                int64_t T = target_base + (int64_t)(W * (1ULL << 48)) - (int64_t)BaseVal;
-                int64_t T_mod = T % (int64_t)MOD_WINDOW;
-                if (T_mod < 0) T_mod += MOD_WINDOW;
-                
-                uint64_t req_start = T_mod;
-                uint64_t req_end = (T_mod + 131071) % MOD_WINDOW;
-
-                auto check_range = [&](uint64_t start, uint64_t end) {
-                    L0_Data dummy = {start, 0};
-                    auto it = std::lower_bound(l0_table.begin(), l0_table.end(), dummy);
+            for (int target_out2 = constraints[0].out2_min; target_out2 <= constraints[0].out2_max; target_out2++) {
+                for (uint64_t W = 0; W <= 13; W++) {
                     
-                    while (it != l0_table.end() && it->mod_val <= end) {
-                        uint64_t L0 = it->L0;
-                        uint64_t S2 = (BaseVal + L0 * MULTIPLIER) & MASK;
-                        
-                        int val2 = (S2 >> 17) % RANGE;
-                        if (val2 >= constraints[0].out2_min && val2 <= constraints[0].out2_max) { 
-                            
-                            uint64_t S0_1 = (U1 << 17) | L0;
-                            uint64_t S0_0 = ((S0_1 - ADDEND) * INV_MULTIPLIER) & MASK;
-                            
-                            uint64_t base_xor = (S0_0 ^ 0x5DEECE66DULL) - constraints[0].offset;
-                            uint64_t base_no_xor = S0_0 - constraints[0].offset;
-                            
-                            if (verify(base_xor, true, constraints)) {
-                                bool expected = false;
-                                if (seed_found.compare_exchange_strong(expected, true)) {
-                                    std::cout << "\n===============================\n";
-                                    std::cout << " MATCH FOUND (WITH XOR)! \n";
-                                    std::cout << " Base Seed: " << (base_xor & MASK) << "\n";
-                                    std::cout << "===============================\n";
-                                }
-                            }
-                            if (verify(base_no_xor, false, constraints)) {
-                                bool expected = false;
-                                if (seed_found.compare_exchange_strong(expected, true)) {
-                                    std::cout << "\n===============================\n";
-                                    std::cout << " MATCH FOUND (NO XOR)! \n";
-                                    std::cout << " Base Seed: " << (base_no_xor & MASK) << "\n";
-                                    std::cout << "===============================\n";
-                                }
-                            }
-                        }
-                        it++;
-                    }
-                };
+                    int64_t target_base = (int64_t)target_out2 * 131072LL;
+                    int64_t T = target_base + (int64_t)(W * (1ULL << 48)) - (int64_t)BaseVal;
+                    int64_t T_mod = T % (int64_t)MOD_WINDOW;
+                    if (T_mod < 0) T_mod += MOD_WINDOW;
+                    
+                    uint64_t req_start = T_mod;
+                    uint64_t req_end = (T_mod + 131071) % MOD_WINDOW;
 
-                if (req_start <= req_end) {
-                    check_range(req_start, req_end);
-                } else {
-                    check_range(req_start, MOD_WINDOW - 1);
-                    check_range(0, req_end);
+                    auto check_range = [&](uint64_t start, uint64_t end) {
+                        L0_Data dummy = {start, 0};
+                        auto it = lower_bound(l0_table.begin(), l0_table.end(), dummy);
+                        
+                        while (it != l0_table.end() && it->mod_val <= end) {
+                            uint64_t L0 = it->L0;
+                            uint64_t S2 = (BaseVal + L0 * MULTIPLIER) & MASK;
+                            
+                            int val2 = (S2 >> 17) % RANGE;
+                            if (val2 >= constraints[0].out2_min && val2 <= constraints[0].out2_max) { 
+                                
+                                uint64_t S0_1 = (U1 << 17) | L0;
+                                uint64_t S0_0 = ((S0_1 - ADDEND) * INV_MULTIPLIER) & MASK;
+                                
+                                uint64_t base_seed = (S0_0 ^ 0x5DEECE66DULL) - constraints[0].offset;
+                                
+                                if (verify(base_seed, constraints)) {
+                                    pthread_mutex_lock(&result_mutex);
+                                    found_seeds.push_back(base_seed & MASK);
+                                    pthread_mutex_unlock(&result_mutex);
+                                }
+                            }
+                            it++;
+                        }
+                    };
+
+                    if (req_start <= req_end) {
+                        check_range(req_start, req_end);
+                    } else {
+                        check_range(req_start, MOD_WINDOW - 1);
+                        check_range(0, req_end);
+                    }
                 }
             }
         }
     }
+    return nullptr;
+}
 
-    if (!seed_found) {
-        std::cout << "Scan finished. No seed found." << std::endl;
+int main() {
+    signal(SIGINT, handle_sigint); //ctrl-c
+
+    constraints = {
+        {30084232LL, 7, 0, 1},
+        {-132867903309LL, 20, 21, 22},
+        {341903212944LL, 6, 0, 1},
+        {209005225403LL, 19, 21, 22},
+        {683776341656LL, 5, 0, 1}
+    };
+
+    MOD_WINDOW = RANGE * 131072ULL; 
+
+    l0_table.resize(131072);
+    for (uint64_t l0 = 0; l0 < 131072; l0++) {
+        l0_table[l0] = {(l0 * MULTIPLIER) % MOD_WINDOW, l0};
     }
+    sort(l0_table.begin(), l0_table.end());    
+
+    cout << "Searching... Press Ctrl-C to stop early and dump seeds." << endl;
+    start_time = chrono::steady_clock::now();
+
+    int num_threads = 12;
+    vector<pthread_t> threads(num_threads);
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], nullptr, worker_thread, nullptr);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], nullptr);
+    }
+
+    // Sort and deduplicate findings
+    sort(found_seeds.begin(), found_seeds.end()); 
+    auto it = unique(found_seeds.begin(), found_seeds.end()); 
+    found_seeds.erase(it, found_seeds.end()); 
+
+    if (found_seeds.empty()) {
+        cout << "Scan finished. No seed found." << endl;
+    } else {
+        cout << "Found " << found_seeds.size() << " unique seeds:" << endl;
+        for (uint64_t seed : found_seeds) {
+            cout << seed << endl;
+        }
+    }
+
     return 0;
 }
