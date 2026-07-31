@@ -29,10 +29,10 @@ int main()
             int left = 0;
             int right = 0;
             for (int i = 0; i < pieces; i++){ // largest span 112 + cross dead zone of 80
-                if(list[i].pos.x <= p.x - 104 && list[i].pos.z <= p.z - 54){
+                if(list[i].pos.x <= p.x - 98 && list[i].pos.z <= p.z - 50){
                     left=1;
                 }
-                if(list[i].pos.z >= p.z - 104 && list[i].pos.z <= p.z - 54){
+                if(list[i].pos.z >= p.z - 98 && list[i].pos.z <= p.z - 50){
                     right=1;
                 }
             }
