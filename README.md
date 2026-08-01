@@ -1,5 +1,30 @@
 # fortress-but-long
 
-This is a work in progress...
+Done! Now running code.
 
-Made a plan trying to calculate chances and ideal position next...
+============================================================
+FOUND 5-FORTRESS CHAIN
+============================================================
+BASE SEED       : 256771810127925
+MOVED SEED      : 179457556916063
+MOVEMENT        : (-1597, 454)
+DISTANCE        : 2051
+INTERSECTIONS   : 257
+
+F1 BLOCK        : (-689792, 196128)
+F1 CHUNK        : (-43112, 12258)
+F2 BLOCK        : (-689584, 196032)
+F2 CHUNK        : (-43099, 12252)
+F3 BLOCK        : (-689376, 196128)
+F3 CHUNK        : (-43086, 12258)
+F4 BLOCK        : (-689168, 196032)
+F4 CHUNK        : (-43073, 12252)
+F5 BLOCK        : (-688960, 196144)
+F5 CHUNK        : (-43060, 12259)
+
+F1 REGION       : (0, 0) -> (-1597, 454)
+F2 REGION       : (0, -1) -> (-1597, 453)
+F3 REGION       : (1, 0) -> (-1596, 454)
+F4 REGION       : (1, -1) -> (-1596, 453)
+F5 REGION       : (2, 0) -> (-1595, 454)
+============================================================
