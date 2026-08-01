@@ -11,67 +11,7 @@
  *   ./move 12 --debug 1
  *   ./move 12 --debug 1 2
  *   ./move 12 --debug 1 2 3 4 5
- *
- *
- * IMPORTANT OPTIMIZATIONS / FIXES
- * ===============================
- *
- * 1. results are supplied by results.h.
- *
- * 2. MAX_PIECES is 512, not 100000.
- *
- * 3. Every worker owns its OWN reusable Piece[512] buffer.
- *
- *    There is NO shared fortress-generation buffer.
- *
- * 4. No malloc/calloc/free occurs while testing a seed.
- *
- * 5. Fortress PieceInfo storage is also worker-local and reusable:
- *
- *       PieceInfo fortressPieces[5][512];
- *
- * 6. getFortressPieces() is never allowed to produce more than
- *    MAX_PIECES pieces. A returned count > MAX_PIECES is rejected.
- *
- * 7. Workers do NOT print progress.
- *
- *    The main thread periodically polls the completion counter and
- *    prints progress. This removes stdout/mutex contention from the
- *    hot path.
- *
- * 8. Workers obtain jobs in batches rather than performing one
- *    atomic fetch_add for every single seed.
- *
- * 9. F1-F5 counters are LOCAL to each worker.
- *
- *    They are aggregated only when the main thread displays progress
- *    and again after the workers finish.
- *
- * 10. The only hot-path global atomics are:
- *
- *       nextJob
- *       jobsCompleted
- *
- * 11. Debug/found-result printing is still mutex protected.
- *
- * 12. Fortress positions use:
- *
- *       REGION_X[i] + moveX
- *       REGION_Z[i] + moveZ
- *
- * 13. isViableStructurePos() receives BLOCK coordinates:
- *
- *       positions[i].x
- *       positions[i].z
- *
- * 14. getFortressPieces() receives CHUNK coordinates:
- *
- *       positions[i].x >> 4
- *       positions[i].z >> 4
- *
- *
- * The reusable buffers are deliberately inside WorkerContext.
- * NEVER move them to global/static shared storage.
+ * (output debug outputs for the passing the nth constraint)
  */
 
 #include "cubiomes/finders.h"
@@ -88,11 +28,6 @@
 #include <errno.h>
 #include <unistd.h>
 
-
-/*
- * Some cubiomes versions expose getFortressPieces()
- * through the library but not through the installed header.
- */
 extern int getFortressPieces(
     Piece *list,
     int n,
@@ -103,91 +38,37 @@ extern int getFortressPieces(
 );
 
 
-/* ============================================================
- * CONFIG
- * ============================================================ */
-
 #define MC_VERSION MC_1_18
 #define STRUCT_TYPE Fortress
-
 #define NUM_FORTS 5
-
-/*
- * This is intentionally small.
- *
- * The old value of 100000 caused a huge allocation/initialization
- * cost and destroyed performance.
- *
- * Every worker gets one reusable buffer of this size.
- */
 #define MAX_PIECES 512
-
-#define MAX_DISTANCE 1000
-
+#define MAX_DISTANCE 6000
 #define DEFAULT_THREADS 12
-
-/*
- * Number of jobs reserved by a worker at once.
- *
- * Larger values reduce atomic contention.
- *
- * The search is not required to terminate in exact job order,
- * so batching is safe.
- */
 #define JOB_BATCH 256
-
-/*
- * Main thread progress polling interval.
- */
 #define PROGRESS_INTERVAL_MS 500
-
-/*
- * Geometry.
- */
 #define X_REACH 98
 #define Z_REACH 40
-
 #define PIECE_RADIUS 8
-
 #define X_MUL 341873128712LL
 #define Z_MUL 132897987541LL
 
 
-/* ============================================================
- * REGION LAYOUT
- * ============================================================ */
-
 static const int REGION_X[NUM_FORTS] = {
     0, 0, 1, 1, 2
 };
-
 static const int REGION_Z[NUM_FORTS] = {
     0, -1, 0, -1, 0
 };
 
-
-/* ============================================================
- * TRANSLATION
- * ============================================================ */
 
 typedef struct {
     int x;
     int z;
 } Translation;
 
-
-/* ============================================================
- * DEBUG
- * ============================================================ */
-
 typedef struct {
     bool enabled[NUM_FORTS];
 } DebugOptions;
-
-
-/* ============================================================
- * COMPACT PIECE REPRESENTATION
- * ============================================================ */
 
 typedef struct {
     int x1;
@@ -195,14 +76,6 @@ typedef struct {
     int x2;
     int z2;
 } PieceInfo;
-
-
-/* ============================================================
- * FORTRESS
- *
- * The PieceInfo storage belongs to the worker context.
- * It is reused for every test.
- * ============================================================ */
 
 typedef struct {
     int startX;
@@ -217,28 +90,12 @@ typedef struct {
     int maxZ;
 } FortressInfo;
 
-
-/* ============================================================
- * WORKER LOCAL STATISTICS
- * ============================================================ */
-
 typedef struct {
     size_t fortressPassed[NUM_FORTS];
 
     size_t fastMatches;
     size_t completeMatches;
 } WorkerStats;
-
-
-/* ============================================================
- * GLOBAL SEARCH STATE
- *
- * Only the job allocator and completion count are atomic in the
- * hot path.
- *
- * Fortress counters are deliberately NOT global atomics.
- * Each worker owns its own counters.
- * ============================================================ */
 
 typedef struct {
     const Translation *translations;
@@ -254,54 +111,16 @@ typedef struct {
     pthread_mutex_t printMutex;
 } SearchState;
 
-
-/* ============================================================
- * WORKER CONTEXT
- *
- * EVERYTHING HERE IS PRIVATE TO ONE WORKER.
- *
- * This is the important part for avoiding the segmentation fault:
- *
- *     Piece rawPieces[512]
- *
- * is NOT shared between workers.
- *
- * Likewise:
- *
- *     fortressPieces[5][512]
- *
- * is private to one worker.
- * ============================================================ */
-
 typedef struct {
     SearchState *state;
     int threadId;
 
     Generator generator;
-
-    /*
-     * Reusable raw Cubiomes buffer.
-     *
-     * No calloc.
-     * No malloc.
-     * No free.
-     */
     Piece rawPieces[MAX_PIECES];
-
-    /*
-     * Reusable compact bounding-box storage.
-     *
-     * Five fortresses × 512 pieces.
-     */
     PieceInfo fortressPieces[NUM_FORTS][MAX_PIECES];
 
     WorkerStats stats;
 } WorkerContext;
-
-
-/* ============================================================
- * STRUCTURE MOVEMENT
- * ============================================================ */
 
 static inline uint64_t moveStructureLocal(
     uint64_t baseSeed,
@@ -316,15 +135,6 @@ static inline uint64_t moveStructureLocal(
         (baseSeed - (uint64_t) delta) &
         MASK48;
 }
-
-
-/* ============================================================
- * GENERATE FORTRESS
- *
- * Reuses worker->rawPieces.
- *
- * No allocation occurs here.
- * ============================================================ */
 
 static bool generateFortress(
     WorkerContext *worker,
@@ -352,17 +162,6 @@ static bool generateFortress(
     out->maxX = INT_MIN;
     out->minZ = INT_MAX;
     out->maxZ = INT_MIN;
-
-    /*
-     * IMPORTANT:
-     *
-     * getFortressPieces() must be passed the actual capacity.
-     *
-     * If the library reports more than that capacity, reject it.
-     *
-     * A correctly implemented Cubiomes function respects n and
-     * therefore cannot write past rawPieces[].
-     */
     count = getFortressPieces(
         worker->rawPieces,
         MAX_PIECES,
@@ -376,11 +175,6 @@ static bool generateFortress(
         return false;
 
     if (count > MAX_PIECES) {
-        /*
-         * This should never happen with a correct implementation,
-         * but treating it as failure prevents out-of-bounds access
-         * in the conversion loop.
-         */
         return false;
     }
 
@@ -413,11 +207,6 @@ static bool generateFortress(
     return true;
 }
 
-
-/* ============================================================
- * PIECE INTERSECTION
- * ============================================================ */
-
 static inline bool piecesIntersect(
     const PieceInfo *a,
     const PieceInfo *b)
@@ -447,11 +236,6 @@ static inline bool piecesIntersect(
     return true;
 }
 
-
-/* ============================================================
- * COUNT PAIR INTERSECTIONS
- * ============================================================ */
-
 static int countPairIntersections(
     const FortressInfo *a,
     const FortressInfo *b)
@@ -473,11 +257,6 @@ static int countPairIntersections(
 
     return count;
 }
-
-
-/* ============================================================
- * CHECK F1
- * ============================================================ */
 
 static inline bool checkF1(
     const FortressInfo *f,
@@ -509,11 +288,6 @@ static inline bool checkF1(
         right &&
         *piece >= 0;
 }
-
-
-/* ============================================================
- * CHECK F2
- * ============================================================ */
 
 static inline bool checkF2(
     const FortressInfo *f,
@@ -555,11 +329,6 @@ static inline bool checkF2(
         *rightPiece >= 0;
 }
 
-
-/* ============================================================
- * CHECK F3
- * ============================================================ */
-
 static inline bool checkF3(
     const FortressInfo *f,
     int *leftPiece,
@@ -588,11 +357,6 @@ static inline bool checkF3(
         *leftPiece >= 0 &&
         *rightPiece >= 0;
 }
-
-
-/* ============================================================
- * CHECK F4
- * ============================================================ */
 
 static inline bool checkF4(
     const FortressInfo *f,
@@ -623,11 +387,6 @@ static inline bool checkF4(
         *rightPiece >= 0;
 }
 
-
-/* ============================================================
- * CHECK F5
- * ============================================================ */
-
 static inline bool checkF5(
     const FortressInfo *f,
     int *leftPiece,
@@ -655,11 +414,6 @@ static inline bool checkF5(
         *leftPiece >= 0 &&
         *rightPiece >= 0;
 }
-
-
-/* ============================================================
- * DEBUG PIECE
- * ============================================================ */
 
 static void printDebugPiece(
     const FortressInfo *f,
@@ -697,11 +451,6 @@ static void printDebugPiece(
         p->z2 - f->startZ
     );
 }
-
-
-/* ============================================================
- * DEBUG FORTRESS
- * ============================================================ */
 
 static void printDebugFortress(
     SearchState *state,
@@ -787,23 +536,6 @@ static void printDebugFortress(
     );
 }
 
-
-/* ============================================================
- * TEST ONE MOVED SEED
- *
- * IMPORTANT ORDER:
- *
- *   1. translated structure positions
- *   2. viability checks
- *   3. fortress generation
- *   4. F1
- *   5. F2
- *   6. F3
- *   7. F4
- *   8. F5
- *   9. concrete piece intersections
- * ============================================================ */
-
 static bool testSeed(
     WorkerContext *worker,
     uint64_t movedSeed,
@@ -827,11 +559,6 @@ static bool testSeed(
     int pieceA[NUM_FORTS];
     int pieceB[NUM_FORTS];
 
-    /*
-     * FortressInfo is tiny. Only initialize the metadata.
-     *
-     * The actual piece arrays are worker-owned.
-     */
     memset(
         forts,
         0,
@@ -846,21 +573,11 @@ static bool testSeed(
             worker->fortressPieces[i];
     }
 
-
-    /* ========================================================
-     * SET NETHER SEED
-     * ======================================================== */
-
     applySeed(
         g,
         DIM_NETHER,
         movedSeed
     );
-
-
-    /* ========================================================
-     * GET ALL TRANSLATED POSITIONS
-     * ======================================================== */
 
     for (int i = 0; i < NUM_FORTS; i++) {
         translatedRegionX[i] =
@@ -880,18 +597,6 @@ static bool testSeed(
             return false;
         }
     }
-
-
-    /* ========================================================
-     * VIABILITY
-     *
-     * IMPORTANT:
-     *
-     * BLOCK coordinates here.
-     *
-     * Do NOT >> 4.
-     * ======================================================== */
-
     for (int i = 0; i < NUM_FORTS; i++) {
         if (!isViableStructurePos(
                 STRUCT_TYPE,
@@ -903,11 +608,6 @@ static bool testSeed(
             return false;
         }
     }
-
-
-    /* ========================================================
-     * F1
-     * ======================================================== */
 
     if (!generateFortress(
             worker,
@@ -947,11 +647,6 @@ static bool testSeed(
             -1
         );
     }
-
-
-    /* ========================================================
-     * F2
-     * ======================================================== */
 
     if (!generateFortress(
             worker,
@@ -993,11 +688,6 @@ static bool testSeed(
         );
     }
 
-
-    /* ========================================================
-     * F3
-     * ======================================================== */
-
     if (!generateFortress(
             worker,
             movedSeed,
@@ -1037,11 +727,6 @@ static bool testSeed(
             pieceB[2]
         );
     }
-
-
-    /* ========================================================
-     * F4
-     * ======================================================== */
 
     if (!generateFortress(
             worker,
@@ -1083,11 +768,6 @@ static bool testSeed(
         );
     }
 
-
-    /* ========================================================
-     * F5
-     * ======================================================== */
-
     if (!generateFortress(
             worker,
             movedSeed,
@@ -1128,24 +808,7 @@ static bool testSeed(
         );
     }
 
-
-    /* ========================================================
-     * ALL FIVE PASSED
-     * ======================================================== */
-
     worker->stats.fastMatches++;
-
-
-    /* ========================================================
-     * CONCRETE CONNECTIVITY
-     *
-     * Only adjacent fortresses need to intersect:
-     *
-     *     F1-F2
-     *     F2-F3
-     *     F3-F4
-     *     F4-F5
-     * ======================================================== */
 
     int totalIntersections = 0;
 
@@ -1164,65 +827,97 @@ static bool testSeed(
     }
 
 
-    /* ========================================================
-     * COMPLETE 5-FORTRESS CHAIN
-     * ======================================================== */
-
     worker->stats.completeMatches++;
 
     pthread_mutex_lock(
         &state->printMutex
     );
 
-    printf(
-        "\n"
-        "============================================================\n"
-        "FOUND 5-FORTRESS CHAIN\n"
-        "============================================================\n"
-        "BASE SEED       : %llu\n"
-        "MOVED SEED      : %llu\n"
-        "MOVEMENT        : (%d, %d)\n"
-        "DISTANCE        : %d\n"
-        "INTERSECTIONS   : %d\n"
-        "\n"
-        "F1 REGION       : (%d, %d) -> (%d, %d)\n"
-        "F2 REGION       : (%d, %d) -> (%d, %d)\n"
-        "F3 REGION       : (%d, %d) -> (%d, %d)\n"
-        "F4 REGION       : (%d, %d) -> (%d, %d)\n"
-        "F5 REGION       : (%d, %d) -> (%d, %d)\n"
-        "============================================================\n",
-        (unsigned long long) baseSeed,
-        (unsigned long long) movedSeed,
-        moveX,
-        moveZ,
-        abs(moveX) + abs(moveZ),
-        totalIntersections,
+printf(
+    "\n"
+    "============================================================\n"
+    "FOUND 5-FORTRESS CHAIN\n"
+    "============================================================\n"
+    "BASE SEED       : %llu\n"
+    "MOVED SEED      : %llu\n"
+    "MOVEMENT        : (%d, %d)\n"
+    "DISTANCE        : %d\n"
+    "INTERSECTIONS   : %d\n"
+    "\n"
+    "F1 BLOCK        : (%d, %d)\n"
+    "F1 CHUNK        : (%d, %d)\n"
+    "F2 BLOCK        : (%d, %d)\n"
+    "F2 CHUNK        : (%d, %d)\n"
+    "F3 BLOCK        : (%d, %d)\n"
+    "F3 CHUNK        : (%d, %d)\n"
+    "F4 BLOCK        : (%d, %d)\n"
+    "F4 CHUNK        : (%d, %d)\n"
+    "F5 BLOCK        : (%d, %d)\n"
+    "F5 CHUNK        : (%d, %d)\n"
+    "\n"
+    "F1 REGION       : (%d, %d) -> (%d, %d)\n"
+    "F2 REGION       : (%d, %d) -> (%d, %d)\n"
+    "F3 REGION       : (%d, %d) -> (%d, %d)\n"
+    "F4 REGION       : (%d, %d) -> (%d, %d)\n"
+    "F5 REGION       : (%d, %d) -> (%d, %d)\n"
+    "============================================================\n",
+    (unsigned long long) baseSeed,
+    (unsigned long long) movedSeed,
+    moveX,
+    moveZ,
+    abs(moveX) + abs(moveZ),
+    totalIntersections,
 
-        REGION_X[0],
-        REGION_Z[0],
-        translatedRegionX[0],
-        translatedRegionZ[0],
+    positions[0].x,
+    positions[0].z,
+    positions[0].x >> 4,
+    positions[0].z >> 4,
 
-        REGION_X[1],
-        REGION_Z[1],
-        translatedRegionX[1],
-        translatedRegionZ[1],
+    positions[1].x,
+    positions[1].z,
+    positions[1].x >> 4,
+    positions[1].z >> 4,
 
-        REGION_X[2],
-        REGION_Z[2],
-        translatedRegionX[2],
-        translatedRegionZ[2],
+    positions[2].x,
+    positions[2].z,
+    positions[2].x >> 4,
+    positions[2].z >> 4,
 
-        REGION_X[3],
-        REGION_Z[3],
-        translatedRegionX[3],
-        translatedRegionZ[3],
+    positions[3].x,
+    positions[3].z,
+    positions[3].x >> 4,
+    positions[3].z >> 4,
 
-        REGION_X[4],
-        REGION_Z[4],
-        translatedRegionX[4],
-        translatedRegionZ[4]
-    );
+    positions[4].x,
+    positions[4].z,
+    positions[4].x >> 4,
+    positions[4].z >> 4,
+
+    REGION_X[0],
+    REGION_Z[0],
+    translatedRegionX[0],
+    translatedRegionZ[0],
+
+    REGION_X[1],
+    REGION_Z[1],
+    translatedRegionX[1],
+    translatedRegionZ[1],
+
+    REGION_X[2],
+    REGION_Z[2],
+    translatedRegionX[2],
+    translatedRegionZ[2],
+
+    REGION_X[3],
+    REGION_Z[3],
+    translatedRegionX[3],
+    translatedRegionZ[3],
+
+    REGION_X[4],
+    REGION_Z[4],
+    translatedRegionX[4],
+    translatedRegionZ[4]
+);
 
     fflush(stdout);
 
@@ -1233,12 +928,6 @@ static bool testSeed(
     return true;
 }
 
-
-/* ============================================================
- * TRANSLATIONS
- *
- * Ordered by increasing Manhattan distance.
- * ============================================================ */
 
 static Translation *makeTranslations(
     int maxDistance,
@@ -1298,10 +987,6 @@ static Translation *makeTranslations(
     return list;
 }
 
-
-/* ============================================================
- * ARGUMENTS
- * ============================================================ */
 
 static void printUsage(
     const char *program)
@@ -1440,20 +1125,6 @@ static bool parseArguments(
     return true;
 }
 
-
-/* ============================================================
- * PROGRESS
- *
- * ONLY THE MAIN THREAD CALLS THIS.
- *
- * Workers never print progress.
- *
- * F1-F5 counters remain worker-local.
- * The main thread aggregates them only for display.
- *
- * This is the F1/F2/F3/F4/F5 PROGRESS FIX.
- * ============================================================ */
-
 static void reportProgress(
     SearchState *state,
     WorkerContext *workers,
@@ -1464,13 +1135,6 @@ static void reportProgress(
     if (completed > totalJobs)
         completed = totalJobs;
 
-    /*
-     * Aggregate worker-local F1-F5 counters.
-     *
-     * These counters are not atomics and are not touched by
-     * other workers. They are read here by the main thread
-     * while the workers are running.
-     */
     size_t fortressPassed[NUM_FORTS] = {
         0, 0, 0, 0, 0
     };
@@ -1482,11 +1146,6 @@ static void reportProgress(
         }
     }
 
-    /*
-     * Since translations are ordered by distance and each
-     * translation contains RESULT_COUNT jobs, this gives the
-     * approximate translation currently being processed.
-     */
     size_t translationIndex =
         completed / RESULT_COUNT;
 
@@ -1521,7 +1180,7 @@ static void reportProgress(
             : 100.0;
 
     printf(
-        "\rJobs: %zu/%zu "
+        "\nJobs: %zu/%zu "
         "(%.3f%%)"
         " | distance: <=%d"
         " | F1: %zu"
@@ -1544,11 +1203,6 @@ static void reportProgress(
     fflush(stdout);
 }
 
-
-/* ============================================================
- * WORKER
- * ============================================================ */
-
 static void *worker(
     void *arg)
 {
@@ -1562,9 +1216,6 @@ static void *worker(
         state->translationCount *
         RESULT_COUNT;
 
-    /*
-     * Each worker gets its own Generator.
-     */
     setupGenerator(
         &worker->generator,
         MC_VERSION,
@@ -1576,12 +1227,6 @@ static void *worker(
                 &state->stop,
                 memory_order_relaxed))
     {
-        /*
-         * Reserve a batch.
-         *
-         * This reduces atomic contention dramatically compared
-         * with one fetch_add per job.
-         */
         size_t begin =
             atomic_fetch_add_explicit(
                 &state->nextJob,
@@ -1656,11 +1301,6 @@ static void *worker(
     return NULL;
 }
 
-
-/* ============================================================
- * MAIN
- * ============================================================ */
-
 int main(
     int argc,
     char **argv)
@@ -1679,11 +1319,6 @@ int main(
         return 1;
     }
 
-
-    /* ========================================================
-     * TRANSLATIONS
-     * ======================================================== */
-
     size_t translationCount = 0;
 
     Translation *translations =
@@ -1701,10 +1336,6 @@ int main(
         return 1;
     }
 
-
-    /* ========================================================
-     * SEARCH STATE
-     * ======================================================== */
 
     SearchState state;
 
@@ -1738,11 +1369,6 @@ int main(
         false
     );
 
-
-    /* ========================================================
-     * PRINT MUTEX
-     * ======================================================== */
-
     if (pthread_mutex_init(
             &state.printMutex,
             NULL) != 0)
@@ -1756,11 +1382,6 @@ int main(
 
         return 1;
     }
-
-
-    /* ========================================================
-     * THREAD ARRAYS
-     * ======================================================== */
 
     pthread_t *threads =
         (pthread_t *) calloc(
@@ -1793,45 +1414,11 @@ int main(
         return 1;
     }
 
-
-    /* ========================================================
-     * STARTUP
-     * ======================================================== */
-
     size_t totalJobs =
         translationCount *
         RESULT_COUNT;
 
-    printf(
-        "============================================================\n"
-        "FORTRESS CHAIN SEARCH\n"
-        "============================================================\n"
-        "Seeds                 : %zu\n"
-        "Max movement distance : %d\n"
-        "Translations          : %zu\n"
-        "Jobs                  : %zu\n"
-        "Threads               : %d\n"
-        "Job batch             : %d\n"
-        "Piece buffer          : %d\n"
-        "X reach               : %d\n"
-        "Z reach               : %d\n"
-        "Piece radius          : %d\n"
-        "Search order          : F1 -> F2 -> F3 -> F4 -> F5\n"
-        "Viability check       : isViableStructurePos()\n"
-        "Region translation    : BASE + MOVEMENT\n"
-        "Progress              : main-thread polling\n"
-        "F1-F5 progress       : enabled\n",
-        RESULT_COUNT,
-        MAX_DISTANCE,
-        translationCount,
-        totalJobs,
-        threadCount,
-        JOB_BATCH,
-        MAX_PIECES,
-        X_REACH,
-        Z_REACH,
-        PIECE_RADIUS
-    );
+    printf("Starting search...\n");
 
     printf("Debug:");
 
@@ -1857,11 +1444,6 @@ int main(
     );
 
     fflush(stdout);
-
-
-    /* ========================================================
-     * CREATE WORKERS
-     * ======================================================== */
 
     int created = 0;
 
@@ -1910,18 +1492,6 @@ int main(
         created++;
     }
 
-
-    /* ========================================================
-     * MAIN THREAD PROGRESS LOOP
-     *
-     * No worker prints progress.
-     *
-     * This loop sleeps most of the time, so it has essentially
-     * zero impact on the search.
-     *
-     * F1-F5 are displayed here.
-     * ======================================================== */
-
     size_t lastReported = 0;
 
     while (true) {
@@ -1959,11 +1529,6 @@ int main(
         );
     }
 
-
-    /* ========================================================
-     * WAIT FOR WORKERS
-     * ======================================================== */
-
     for (int i = 0;
          i < created;
          i++)
@@ -1993,11 +1558,6 @@ int main(
     );
 
     printf("\n\n");
-
-
-    /* ========================================================
-     * AGGREGATE LOCAL WORKER STATS
-     * ======================================================== */
 
     size_t fortressPassed[NUM_FORTS] = {
         0, 0, 0, 0, 0
@@ -2031,11 +1591,6 @@ int main(
                 .completeMatches;
     }
 
-
-    /* ========================================================
-     * FINAL RESULTS
-     * ======================================================== */
-
     printf(
         "============================================================\n"
         "SEARCH COMPLETE\n"
@@ -2063,11 +1618,6 @@ int main(
         fastMatches,
         completeMatches
     );
-
-
-    /* ========================================================
-     * CLEANUP
-     * ======================================================== */
 
     free(workers);
     free(threads);
